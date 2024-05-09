@@ -31,6 +31,8 @@
 
 #pragma once
 
+// clang-format off
+
 #include "cutlass/barrier.h"
 #include "cutlass/block_striped.h"
 #include "cutlass/fast_math.h"
@@ -76,6 +78,7 @@ public:
     int32_t N_idx = 0;
     int32_t K_idx = 0;
     int32_t L_idx = 0;
+    int32_t linear_idx = 0;
 
     // Number of k tiles to compute for this unit of work. For stream-K, this
     // can indicate the number of K tiles across multiple output tiles.
@@ -126,7 +129,7 @@ public:
     CUTLASS_HOST_DEVICE
     static WorkTileInfo
     invalid_work_tile() {
-      return {-1, -1, -1, -1, 0};
+      return {-1, -1, -1, -1, -1, 0};
     }
 
     CUTLASS_HOST_DEVICE
@@ -250,8 +253,13 @@ public:
 
   CUTLASS_DEVICE
   WorkTileInfo
-  get_current_work() const {
-    return get_current_work_for_linear_idx(current_work_linear_idx_, scheduler_params);
+  get_current_work() {
+    auto work_tile_info = get_current_work_for_linear_idx(current_work_linear_idx_, scheduler_params);
+    while (!work_tile_info.is_valid() && work_tile_info.linear_idx >= 0) {
+      advance_to_next_work();
+      work_tile_info = get_current_work_for_linear_idx(current_work_linear_idx_, scheduler_params);
+    }
+    return work_tile_info;
   }
 
   CUTLASS_DEVICE
@@ -343,7 +351,7 @@ public:
   static bool
   requires_fixup(Params const& params, WorkTileInfo const& work_tile_info) {
     // Fixup is not needed for invalid or data-parallel tiles
-    return work_tile_info.is_valid() && work_tile_info.k_tile_count != params.divmod_tiles_per_output_tile_.divisor;
+    return work_tile_info.is_valid() && (work_tile_info.k_tile_count != params.divmod_tiles_per_output_tile_.divisor || params.requires_separate_reduction());
   }
 
   CUTLASS_HOST_DEVICE
@@ -399,14 +407,14 @@ public:
     auto lock_idx = (tile_idx * num_barriers) + barrier_idx;
 
     auto reduction_tile_idx = tile_idx;
-    auto [first_peer_id, my_peer_id, last_peer_id] = tile_peer_range(params, tile_idx, static_cast<uint32_t>(work_tile_info.K_idx));
+    auto [first_peer_id, my_peer_id, last_peer_id] = tile_peer_range(params, work_tile_info.linear_idx, tile_idx, static_cast<uint32_t>(work_tile_info.K_idx));
     auto reduction_peer_offset = 0;
     if (params.requires_separate_reduction()) {
       // If separate reduction is to be performed, each stream-K unit writes its partials
       // to a separate portion of the workspace. There are as many of these portions as there
       // are peers for a given output tile, so we multiply the tile index by the maximum peer count.
       reduction_tile_idx *= Params::max_peers_per_tile(params.sk_units_, params.sk_tiles_);
-      reduction_peer_offset = my_peer_id * cute::size<0>(TileShape{}) * cute::size<1>(TileShape{});
+      reduction_peer_offset = (my_peer_id - first_peer_id) * cute::size<0>(TileShape{}) * cute::size<1>(TileShape{});
     }
 
     // Reductions use BlockStripedReduce with a width of BarrierManager::ThreadCount under the hood.
@@ -635,6 +643,8 @@ private:
     uint64_t linear_idx,
     WorkTileInfo& work_tile_info) {
 
+    work_tile_info.linear_idx = linear_idx;
+
     uint64_t output_tile_id = linear_idx;
     if (linear_idx >= params.units_per_problem_ * params.splits_) {
       // Separate-reduction work
@@ -847,14 +857,46 @@ private:
   // Returns the starting and ending peer ID of this tile
   CUTLASS_HOST_DEVICE
   static auto
-  tile_peer_range(Params const& params, uint32_t tile_idx, uint32_t cur_k_tile) {
+  tile_peer_range(Params const& params, int32_t linear_idx, uint32_t tile_idx, uint32_t cur_k_tile) {
+    bool is_split_k = params.splits_ > 1;
+
     auto tile_idx_in_cluster_path = params.div_cluster_size(tile_idx);
     auto start_k_tile = params.divmod_tiles_per_output_tile_.divisor * tile_idx_in_cluster_path;
     auto end_k_tile = start_k_tile + params.divmod_tiles_per_output_tile_.divisor - 1;
-    auto big_unit_k_tiles = params.big_units_ * (params.k_tiles_per_sk_unit_ + 1);
 
-    auto adjust_unit = [&](uint32_t k_tile, uint32_t unit_idx, uint32_t k_tiles_per_unit) {
-      auto unit_k_start = unit_idx * k_tiles_per_unit;
+    cur_k_tile += start_k_tile;
+
+
+    // =====================================================
+
+    auto cluster_linear_work_idx = params.div_cluster_size(linear_idx);
+
+    uint64_t group_idx;
+    params.divmod_sk_groups_(cluster_linear_work_idx, group_idx, cluster_linear_work_idx);
+
+    // Determine whether we are in a "big group" that will process an additional
+    // stream-K cluster tile.
+    auto sk_cluster_tiles = params.div_cluster_size(params.sk_tiles_);
+    auto sk_cluster_tiles_in_group = params.divmod_sk_groups_.divide(sk_cluster_tiles);
+    if (group_idx < params.big_groups_) {
+      ++sk_cluster_tiles_in_group;
+    }
+
+    // Determine whether we are in a "big unit" within the group, that will process
+    // an additional K chunk in the group.
+    auto sk_tiles_in_group = sk_cluster_tiles_in_group * params.get_cluster_size();
+    auto k_tiles_in_group = sk_tiles_in_group * params.divmod_tiles_per_output_tile_.divisor;
+    auto k_tiles_per_unit_in_group = params.divmod_sk_units_per_group_.divide(k_tiles_in_group);
+    auto big_units_in_group = params.div_cluster_size(
+      k_tiles_in_group - (k_tiles_per_unit_in_group * params.divmod_sk_units_per_group_.divisor));
+
+    // =====================================================
+
+    
+    auto big_units = is_split_k ? params.big_units_ : big_units_in_group;
+    auto big_unit_k_tiles = big_units * (params.k_tiles_per_sk_unit_ + 1);
+
+    auto adjust_unit = [&](uint32_t k_tile, uint32_t unit_idx, uint32_t unit_k_start, uint32_t k_tiles_per_unit) {
       auto unit_k_end = unit_k_start + k_tiles_per_unit;
       if (k_tile - start_k_tile < Params::min_iters_per_sk_unit_ &&
           unit_k_end - start_k_tile < Params::min_iters_per_sk_unit_) {
@@ -881,14 +923,14 @@ private:
         // The tile is within the "big unit range"
         auto k_tiles_per_unit = params.k_tiles_per_sk_unit_ + 1;
         auto unit_idx = k_tile / k_tiles_per_unit;
-        return static_cast<uint64_t>(adjust_unit(k_tile, unit_idx, k_tiles_per_unit));
+        return static_cast<uint64_t>(adjust_unit(k_tile, unit_idx, unit_idx * k_tiles_per_unit, k_tiles_per_unit));
       }
       else {
         // The tile is after the "big unit range." Account for this by finding the "normal unit"
         // that it belongs to, and then offsetting by the number of big units
         auto k_tiles_per_unit = params.k_tiles_per_sk_unit_;
-        auto unit_idx = ((k_tile - big_unit_k_tiles) / params.k_tiles_per_sk_unit_) + (params.big_units_);
-        return static_cast<uint64_t>(adjust_unit(k_tile, unit_idx, k_tiles_per_unit));
+        auto unit_idx = ((k_tile - big_unit_k_tiles) / params.k_tiles_per_sk_unit_) + (big_units);
+        return static_cast<uint64_t>(adjust_unit(k_tile, unit_idx,  unit_idx * k_tiles_per_unit + big_units, k_tiles_per_unit));
       }
     };
 
