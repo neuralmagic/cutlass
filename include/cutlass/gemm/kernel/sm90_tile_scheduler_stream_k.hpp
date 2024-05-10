@@ -633,6 +633,47 @@ public:
   }
 
 private:
+
+  struct GroupKTiling {
+    uint64_t k_tiles;
+    uint64_t k_tiles_per_unit;
+  };
+  
+  // For stream-K, stream-k tiles are split into groups, compute how the k-tiles within 
+  //  this group should be divided
+  CUTLASS_DEVICE
+  static GroupKTiling
+  compute_group_k_tiling(Params const& params, uint64_t const& group_idx) {
+    // Determine whether we are in a "big group" that will process an additional
+    // stream-K cluster tile.
+    auto sk_cluster_tiles = params.div_cluster_size(params.sk_tiles_);
+    auto sk_cluster_tiles_in_group = params.divmod_sk_groups_.divide(sk_cluster_tiles);
+    if (group_idx < params.big_groups_) {
+      ++sk_cluster_tiles_in_group;
+    }
+
+    auto sk_tiles_in_group = sk_cluster_tiles_in_group * params.get_cluster_size();
+    auto k_tiles_in_group = sk_tiles_in_group * params.divmod_tiles_per_output_tile_.divisor;
+    auto k_tiles_per_unit_in_group = params.divmod_sk_units_per_group_.divide(k_tiles_in_group); 
+
+    return {k_tiles_in_group, k_tiles_per_unit_in_group};
+  }
+
+  CUTLASS_DEVICE
+  static uint32_t
+  compute_big_units(Params const& params, GroupKTiling const& group_k_tiling, bool is_split_k) {
+    if (is_split_k) {
+      return params.big_units_;
+    } else { // Stream-K / Data-Parallel
+      auto sk_units_per_group = params.divmod_sk_units_per_group_.divisor;
+      // Determine whether we are in a "big unit" within the group, that will process
+      // an additional K chunk in the group.
+      auto big_units_in_group = params.div_cluster_size(
+        group_k_tiling.k_tiles - (group_k_tiling.k_tiles_per_unit * sk_units_per_group));
+      return big_units_in_group;
+    }
+  }
+
   // Sets the current stream-K work to compute within work_tile_info. If new_unit is true, work_tile_info
   // is populated as a new unit of work. Otherwise, state existing in work_tile_info (e.g., remaining
   // iterations) is used to find the next tile in the current work unit.
@@ -687,30 +728,17 @@ private:
       uint64_t group_idx;
       params.divmod_sk_groups_(cluster_linear_work_idx, group_idx, cluster_linear_work_idx);
 
-      // Determine whether we are in a "big group" that will process an additional
-      // stream-K cluster tile.
-      auto sk_cluster_tiles = params.div_cluster_size(params.sk_tiles_);
-      auto sk_cluster_tiles_in_group = params.divmod_sk_groups_.divide(sk_cluster_tiles);
-      if (group_idx < params.big_groups_) {
-        ++sk_cluster_tiles_in_group;
-      }
-
-      // Determine whether we are in a "big unit" within the group, that will process
-      // an additional K chunk in the group.
-      auto sk_tiles_in_group = sk_cluster_tiles_in_group * params.get_cluster_size();
-      auto k_tiles_in_group = sk_tiles_in_group * params.divmod_tiles_per_output_tile_.divisor;
-      auto k_tiles_per_unit_in_group = params.divmod_sk_units_per_group_.divide(k_tiles_in_group);
-      auto big_units_in_group = params.div_cluster_size(
-        k_tiles_in_group - (k_tiles_per_unit_in_group * params.divmod_sk_units_per_group_.divisor));
-
       uint64_t split;
       params.divmod_clusters_mnl_(split, cluster_linear_work_idx, cluster_linear_work_idx);
 
+      auto group_k_tiling = compute_group_k_tiling(params, group_idx);
+
       bool is_split_k = params.splits_ > 1;
       auto big_unit_cmp_lhs = is_split_k ? split : cluster_linear_work_idx;
-      auto big_unit_cmp_rhs = is_split_k ? params.big_units_ : big_units_in_group;
-      auto linear_idx_mult = is_split_k ? params.divmod_tiles_per_output_tile_.divisor : k_tiles_per_unit_in_group;
-      auto k_tiles_per_split = is_split_k ? params.k_tiles_per_sk_unit_ : k_tiles_per_unit_in_group;
+      auto big_unit_cmp_rhs = compute_big_units(params, group_k_tiling, is_split_k);
+      auto tiles_per_output = params.divmod_tiles_per_output_tile_.divisor;
+      auto linear_idx_mult = is_split_k ? tiles_per_output : group_k_tiling.k_tiles_per_unit;
+      auto k_tiles_per_split = is_split_k ? params.k_tiles_per_sk_unit_ : group_k_tiling.k_tiles_per_unit;
 
       // Determine the starting k iteration computed by this stream-K work unit
       uint32_t unit_iter_start = (linear_idx_mult * cluster_linear_work_idx) +
@@ -857,43 +885,18 @@ private:
   // Returns the starting and ending peer ID of this tile
   CUTLASS_HOST_DEVICE
   static auto
-  tile_peer_range(Params const& params, int32_t linear_idx, uint32_t tile_idx, uint32_t cur_k_tile) {
+  tile_peer_range(Params const& params, int32_t linear_idx, uint32_t tile_idx, uint32_t relative_cur_k_tile) {
     bool is_split_k = params.splits_ > 1;
-
     auto tile_idx_in_cluster_path = params.div_cluster_size(tile_idx);
-    auto start_k_tile = params.divmod_tiles_per_output_tile_.divisor * tile_idx_in_cluster_path;
-    auto end_k_tile = start_k_tile + params.divmod_tiles_per_output_tile_.divisor - 1;
-
-    cur_k_tile += start_k_tile;
-
-
-    // =====================================================
-
     auto cluster_linear_work_idx = params.div_cluster_size(linear_idx);
 
-    uint64_t group_idx;
-    params.divmod_sk_groups_(cluster_linear_work_idx, group_idx, cluster_linear_work_idx);
+    auto start_k_tile = params.divmod_tiles_per_output_tile_.divisor * tile_idx_in_cluster_path;
+    auto end_k_tile = start_k_tile + params.divmod_tiles_per_output_tile_.divisor - 1;
+    auto cur_k_tile = relative_cur_k_tile + start_k_tile;
 
-    // Determine whether we are in a "big group" that will process an additional
-    // stream-K cluster tile.
-    auto sk_cluster_tiles = params.div_cluster_size(params.sk_tiles_);
-    auto sk_cluster_tiles_in_group = params.divmod_sk_groups_.divide(sk_cluster_tiles);
-    if (group_idx < params.big_groups_) {
-      ++sk_cluster_tiles_in_group;
-    }
-
-    // Determine whether we are in a "big unit" within the group, that will process
-    // an additional K chunk in the group.
-    auto sk_tiles_in_group = sk_cluster_tiles_in_group * params.get_cluster_size();
-    auto k_tiles_in_group = sk_tiles_in_group * params.divmod_tiles_per_output_tile_.divisor;
-    auto k_tiles_per_unit_in_group = params.divmod_sk_units_per_group_.divide(k_tiles_in_group);
-    auto big_units_in_group = params.div_cluster_size(
-      k_tiles_in_group - (k_tiles_per_unit_in_group * params.divmod_sk_units_per_group_.divisor));
-
-    // =====================================================
-
-    
-    auto big_units = is_split_k ? params.big_units_ : big_units_in_group;
+    auto group_idx = params.divmod_sk_groups_.divide(cluster_linear_work_idx);
+    auto group_k_tiling = compute_group_k_tiling(params, group_idx);
+    auto big_units = compute_big_units(params, group_k_tiling, is_split_k);
     auto big_unit_k_tiles = big_units * (params.k_tiles_per_sk_unit_ + 1);
 
     auto adjust_unit = [&](uint32_t k_tile, uint32_t unit_idx, uint32_t unit_k_start, uint32_t k_tiles_per_unit) {
