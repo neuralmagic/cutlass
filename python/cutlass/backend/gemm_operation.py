@@ -565,7 +565,9 @@ class GemmArguments3x(GemmArguments2x):
         )
 
         # Set hardware info
-        hw_info_ = hw_info(0, device_sm_count())
+        hw_info_ = hw_info(
+            0, device_sm_count(),
+        )
 
         self.arguments = argument_type(
             int(self.gemm_mode),
@@ -1300,7 +1302,7 @@ using DeviceKernel = cutlass::gemm::device::GemmUniversalAdapter<${operation_nam
         # Support built-in epilogue functors or user-defined functions
 
         if operation.tile_description.stages is None or operation.tile_description.stages == 0:
-            stage_count_type = "cutlass::gemm::collective::StageCountAutoCarveout<sizeof(typename CollectiveEpilogue::SharedStorage)>"
+            stage_count_type = "cutlass::gemm::collective::StageCountAutoCarveout<static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>"
         else:
             stage_count_type = "_" + str(operation.tile_description.stages)
 
@@ -1652,7 +1654,7 @@ class GemmOperationBase:
         extended_name = "{core_name}_{element_a}_{element_b}_{element_acc}_{element_c}_{element_d}".format(
             element_a=DataTypeNames[self.A.element],
             element_b=DataTypeNames[self.B.element],
-            element_acc=DataTypeNames[self.tile_description.math_instruction.element_accumulator],
+            element_acc=DataTypeNames[self.accumulator_type()],
             element_c=DataTypeNames[self.C.element],
             element_d=DataTypeNames[self.epilogue_functor.element_output],
             core_name=self.core_name())

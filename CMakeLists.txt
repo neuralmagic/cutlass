@@ -38,7 +38,7 @@ else()
 endif()
 
 message(STATUS "CMake Version: ${CMAKE_VERSION}")
-set(IMPLICIT_CMAKE_CXX_STANDARD OFF CACHE BOOL "Do not explicitly specify -std=c++11 if set")
+set(IMPLICIT_CMAKE_CXX_STANDARD OFF CACHE BOOL "Do not explicitly specify -std=c++17 if set")
 
 # To reduce duplicate version locations, parse the version out of the
 # main versions.h file and reuse it here.
@@ -67,14 +67,13 @@ elseif (CUDA_VERSION VERSION_LESS 11.4)
   message(WARNING "CUTLASS ${CUTLASS_VERSION} support for CUDA ${CUDA_VERSION} is deprecated, please use CUDA 11.8 or higher.")
 endif()
 
-if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 7.5)
-  message(FATAL_ERROR "GCC version must be at least 7.5!")
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 7.3)
+  message(FATAL_ERROR "GCC version must be at least 7.3!")
 endif()
 
 if (CUDA_COMPILER MATCHES "[Cc]lang" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 7.0)
   message(FATAL_ERROR "Clang 7.0+ required for GPU compilation")
 endif()
-
 find_package(Doxygen QUIET)
 
 ################################################################################
@@ -168,6 +167,7 @@ endif()
 include(GNUInstallDirs)
 
 link_directories(${CUDA_TOOLKIT_ROOT_DIR}/lib64/stubs)
+link_directories(${CUDA_TOOLKIT_ROOT_DIR}/lib64)
 
 ###################################################################################################
 #
@@ -332,6 +332,18 @@ endif()
 
 
 
+# Warnings-as-error exceptions and warning suppressions for Clang builds
+if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-error=implicit-int-conversion ")
+  list(APPEND CUTLASS_CUDA_NVCC_FLAGS "-Wno-error=implicit-int-conversion" )
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-error=pass-failed ")
+  list(APPEND CUTLASS_CUDA_NVCC_FLAGS "-Wno-error=pass-failed" )
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-error=inconsistent-missing-override ")
+  list(APPEND CUTLASS_CUDA_NVCC_FLAGS "-Wno-error=inconsistent-missing-override" )
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-sign-conversion ")
+  list(APPEND CUTLASS_CUDA_NVCC_FLAGS "-Wno-sign-conversion" )
+endif()
+
 if (NOT MSVC AND CUTLASS_NVCC_KEEP)
   # MSVC flow handles caching already, but for other generators we handle it here.
   set(CUTLASS_NVCC_KEEP_DIR ${CMAKE_CURRENT_BINARY_DIR}/tmp CACHE PATH "Location to store NVCC scratch files")
@@ -357,6 +369,7 @@ if (CUTLASS_ENABLE_OPENMP_TESTS)
     message(WARNING "CUTLASS_ENABLE_OPENMP_TESTS set but OpenMP not found.")
   endif()
 endif()
+
 if(UNIX)
   list(APPEND CUTLASS_CUDA_NVCC_FLAGS -Xcompiler=-Wconversion)
   list(APPEND CUTLASS_CUDA_NVCC_FLAGS -Xcompiler=-fno-strict-aliasing)
